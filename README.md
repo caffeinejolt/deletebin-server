@@ -38,8 +38,3 @@ Here is an example config file:
     }
 
 
-## Other Repos
-
-In case you are looking for something other than the server component, here are the other DeleteBin related repos:
-
- - DeleteBin Browser Extension
