@@ -31,6 +31,6 @@ The below function does nothing - only the real server runs the actual code
 
 */
 
-func stoHIPSecret(req *http.Request) string {
-	return ""
+func stoHIPSecret(req *http.Request) []byte {
+	return nil
 }

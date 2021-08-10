@@ -10,6 +10,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -28,7 +29,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/awnumar/memguard"
 	badger "github.com/dgraph-io/badger/v3"
@@ -48,9 +48,10 @@ var (
 	ctIDRX     *regexp.Regexp
 	emailRX    *regexp.Regexp
 	randFac    chan [8]byte
-	hmacSecret *[32]byte
-	hIPSecrets []*[32]byte
+	hmacSecret *memguard.LockedBuffer
+	hIPSecrets []*memguard.LockedBuffer
 	gidCounter = randUInt32()
+	getKeys    activeGetKeys
 )
 
 // values in config file
@@ -72,6 +73,17 @@ type globalConfig struct {
 type response struct {
 	Error  string
 	Result interface{}
+}
+
+// limits sGetHandler transactions for the same key to one at a time
+type activeGetKeysWaiter struct {
+	wait  chan struct{}
+	count int
+}
+
+type activeGetKeys struct {
+	sync.Mutex
+	active map[string]*activeGetKeysWaiter
 }
 
 // limits the number of times /contact api endpoint can be used
@@ -138,13 +150,10 @@ func init() {
 	}(randFac)
 
 	// HMAC secret updates on restart
-	hmacbuf := memguard.NewBuffer(32)
-	hmacSecret = (*[32]byte)(unsafe.Pointer(&hmacbuf.Bytes()[0]))
-	_, err := rand.Read((*hmacSecret)[:])
-	if err != nil {
-		log.Panicln(err)
-	}
-	hmacbuf.Freeze()
+	hmacSecret = memguard.NewBufferRandom(32)
+
+	// init getKeys for use in sGetHandler
+	getKeys.active = make(map[string]*activeGetKeysWaiter)
 
 	// ludicrous amount of bits to hash IPs protected by guard pages
 	// why more than one? if someone could read process memory, they can get the secrets used to hash IPs
@@ -153,14 +162,7 @@ func init() {
 	// how much extra protection does this really provide if someone has already gained
 	// enough access to read process memory?  not sure, but at least its something
 	for i := 0; i < 10; i++ {
-		b := memguard.NewBuffer(32)
-		hips := (*[32]byte)(unsafe.Pointer(&b.Bytes()[0]))
-		_, err = rand.Read((*hips)[:])
-		if err != nil {
-			log.Panicln(err)
-		}
-		b.Freeze()
-		hIPSecrets = append(hIPSecrets, hips)
+		hIPSecrets = append(hIPSecrets, memguard.NewBufferRandom(32))
 	}
 
 	// Validation regexes
@@ -202,13 +204,16 @@ func randUInt32() uint32 {
 // Create a secure hash of an IP (IPv4 or 6 - all the same to us since it is a string)
 // this only yields consistent hashing for the same IP between process restarts
 // this is of course annoying but a necessary tradeoff to ensure IP privacy
-func hashIP(ip string, stoSecret string) string {
-	buf := []byte(ip + stoSecret)
+func hashIP(ip string, secret []byte) string {
 	for _, hip := range hIPSecrets {
-		buf = append(buf, (*hip)[:]...)
+		secret = append(secret, hip.Bytes()...)
 	}
-	iphash := fmt.Sprintf("%x", sha256.Sum256(buf))
-	return iphash[:len(iphash)-32]
+	hmac := hmac.New(sha256.New, secret)
+	_, err := hmac.Write([]byte(ip))
+	if err != nil {
+		log.Panicln(err)
+	}
+	return fmt.Sprintf("%x", hmac.Sum(nil))
 }
 
 // encode a record for DB storage
@@ -399,11 +404,51 @@ func sGetHandler(rw http.ResponseWriter, req *http.Request) {
 	cRequired := errors.New("captcha required")
 	now := time.Now()
 
+	// Users need assurance that if a message was set to only ever be retrieved once, that it can indeed
+	// only be retrieved once. It is possible given badgerdb, although unlikely, that a timing attack could
+	// be used to retrieve a message more than once if a bunch of gets came in before the transaction was
+	// committed.  We therefore guard against this to ensure that there can only ever be one open transaction
+	// for the same key.
+
+	var waiter *activeGetKeysWaiter
+	getKey := keyPrefixCT + request.ID
+	exists := true
+	for exists {
+		getKeys.Lock()
+		waiter, exists = getKeys.active[getKey]
+		if exists {
+			waiter.count++
+			count := waiter.count
+			getKeys.Unlock()
+			if count > 3 {
+				// discourage this sort of thing - should be extremely rare to non-existent outside of it being done on purpose
+				log.Println("Requests fighting for same key")
+				response.Error = "Invalid ID"
+				printResponse(response, rw, http.StatusInternalServerError)
+				return
+			}
+			time.Sleep(1 * time.Second)
+			<-waiter.wait
+		} else {
+			waiter = &activeGetKeysWaiter{wait: make(chan struct{})}
+			getKeys.active[getKey] = waiter
+			getKeys.Unlock()
+		}
+	}
+	defer func() {
+		go func() {
+			getKeys.Lock()
+			delete(getKeys.active, getKey)
+			close(waiter.wait)
+			getKeys.Unlock()
+		}()
+	}()
+
 	// NOTE: we issue an update transaction here since excluding the scenario where the key
 	// does not exist, we have to update/delete the record for RTL anwyays
 
 	err = db.Update(func(txn *badger.Txn) error {
-		item, err := txn.Get([]byte(keyPrefixCT + request.ID))
+		item, err := txn.Get([]byte(getKey))
 		if err != nil {
 			return err // record either does not exist or we have problems
 		}
@@ -437,19 +482,19 @@ func sGetHandler(rw http.ResponseWriter, req *http.Request) {
 				Created: ctr.Created,
 			}
 			// we give them 10 minutes to decide if it is spam
-			entry := badger.NewEntry([]byte(keyPrefixRV+request.ID), encodeRecord(rvr)).WithTTL(time.Second * time.Duration(600))
+			entry := badger.NewEntry([]byte(getKey), encodeRecord(rvr)).WithTTL(time.Second * time.Duration(600))
 			err = txn.SetEntry(entry)
 			if err != nil {
 				return err
 			}
 			// delete CT record
-			err = txn.Delete([]byte(keyPrefixCT + request.ID))
+			err = txn.Delete([]byte(getKey))
 		} else {
 			// we have to decrement rtl
 			ctr.RTL--
 			ctr.Updated = now.Unix()
 			ctrRecord := encodeRecord(ctr)
-			entry := badger.NewEntry([]byte(keyPrefixCT+request.ID), ctrRecord).WithTTL(time.Second * time.Duration(int64(item.ExpiresAt())-now.Unix()))
+			entry := badger.NewEntry([]byte(getKey), ctrRecord).WithTTL(time.Second * time.Duration(int64(item.ExpiresAt())-now.Unix()))
 			err = txn.SetEntry(entry)
 		}
 		return err
@@ -549,12 +594,14 @@ func sSetHandler(rw http.ResponseWriter, req *http.Request) {
 		printResponse(response, rw, http.StatusOK)
 		return
 	}
-	hmac := hmac.New(sha256.New, (*hmacSecret)[:])
+	hmac := hmac.New(sha256.New, hmacSecret.Bytes())
 	_, err = hmac.Write([]byte(ctParts[0] + strconv.Itoa(int(request.Deadline))))
 	if err != nil {
 		log.Panicln(err)
 	}
-	if base64.RawURLEncoding.EncodeToString(hmac.Sum(nil)) != request.HMAC {
+	compareNew := []byte(base64.RawURLEncoding.EncodeToString(hmac.Sum(nil)))
+	compareReq := []byte(request.HMAC)
+	if subtle.ConstantTimeCompare(compareNew, compareReq) == 0 {
 		response.Error = "Invalid HMAC/Iter/Deadline"
 		printResponse(response, rw, http.StatusOK)
 		return
@@ -926,7 +973,7 @@ func sPreSetHandler(rw http.ResponseWriter, req *http.Request) {
 
 	deadline := int(now.Unix() + 120) // they have 30 seconds to sSet
 
-	hmac := hmac.New(sha256.New, hmacSecret[:])
+	hmac := hmac.New(sha256.New, hmacSecret.Bytes())
 	_, err = hmac.Write([]byte(strconv.FormatInt(iter, 10) + strconv.Itoa(deadline)))
 	if err != nil {
 		log.Panicln(err)
@@ -946,16 +993,6 @@ func sPreSetHandler(rw http.ResponseWriter, req *http.Request) {
 
 // run the completion token by hcaptcha to verify authenticity
 func hCaptchaVerify(token string) (bool, error) {
-	/*
-		reqBody, err := json.Marshal(map[string]string{
-			"secret":   config.HCSecret,
-			"sitekey":  config.HCSiteKey,
-			"response": token,
-		})
-		if err != nil {
-			log.Panicln(err)
-		}
-	*/
 	var client = &http.Client{
 		Timeout: time.Second * 10,
 	}
