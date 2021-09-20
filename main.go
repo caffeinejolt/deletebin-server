@@ -27,11 +27,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/awnumar/memguard"
 	badger "github.com/dgraph-io/badger/v3"
+	"github.com/mr-tron/base58"
 	"github.com/vmihailenco/msgpack/v5"
 	gomail "gopkg.in/gomail.v2"
 )
@@ -47,7 +47,7 @@ var (
 	db         *badger.DB
 	ctIDRX     *regexp.Regexp
 	emailRX    *regexp.Regexp
-	randFac    chan [8]byte
+	randFac    chan [16]byte
 	hmacSecret *memguard.LockedBuffer
 	hIPSecrets []*memguard.LockedBuffer
 	gidCounter = randUInt32()
@@ -129,10 +129,10 @@ type rvRecord struct {
 func init() {
 
 	// Make less calls to rand.Read by reading in 256 bytes each time
-	randFac = make(chan [8]byte, 1000)
+	randFac = make(chan [16]byte, 1000)
 	var b [256]byte
 	var count int64
-	go func(randFac chan [8]byte) {
+	go func(randFac chan [16]byte) {
 		for {
 			cur := count & 0xF
 			count++
@@ -142,8 +142,8 @@ func init() {
 					log.Panicln(err)
 				}
 			}
-			start, end := cur*8, (cur+1)*8
-			var out [8]byte
+			start, end := cur*16, (cur+1)*16
+			var out [16]byte
 			copy(out[:], b[start:end])
 			randFac <- out
 		}
@@ -166,30 +166,16 @@ func init() {
 	}
 
 	// Validation regexes
-	ctIDRX = regexp.MustCompile(`^[a-zA-Z0-9_\-]{10,20}$`)
+	ctIDRX = regexp.MustCompile(`^[a-zA-Z0-9]{20,24}$`)
 	emailRX = regexp.MustCompile("^[a-zA-Z0-9.!#$%&'*+\\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$")
 
 }
 
 // Generate a secure url-friendly global-enough ID
-// We delete everything shortly after it is stored so
-// randomness is more important that perfect uniqueness
 func getGID() string {
-	var gid [11]byte
-	i := atomic.AddUint32(&gidCounter, 1)
-	gid[0] = byte(i >> 16)
-	gid[1] = byte(i >> 8)
-	gid[2] = byte(i)
+	// random 16 bytes should be big enough to avoid collisions
 	randBytes := <-randFac
-	gid[3] = randBytes[0]
-	gid[4] = randBytes[1]
-	gid[5] = randBytes[2]
-	gid[6] = randBytes[3]
-	gid[7] = randBytes[4]
-	gid[8] = randBytes[5]
-	gid[9] = randBytes[6]
-	gid[10] = randBytes[7]
-	return base64.RawURLEncoding.EncodeToString(gid[:])
+	return string(base58.Encode(randBytes[:]))
 }
 
 // A random uint32
